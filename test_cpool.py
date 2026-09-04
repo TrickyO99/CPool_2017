@@ -68,24 +68,44 @@ def run(cmd, cwd=None, timeout=30):
 class TestDay07Task04PrintParams:
     """my_print_params.c calls my_putstr()/my_putchar(), which are NOT
     defined in the .c file itself -- they come from the pre-built
-    libmy.a sitting right next to it. This is a real, known-buildable
-    piece from the exercise set: compile + statically link, then check
-    that each argv entry is printed on its own line."""
+    libmy.a sitting right next to it.
+
+    QA finding: on this Windows/MinGW-w64 environment, libmy.a turns out
+    to hold Linux ELF64 object files (`objdump -f` reports
+    `file format elf64-x86-64` for every member), not Windows COFF/PE
+    objects -- a leftover from the original 2017 Epitech Linux VM. GNU ld
+    will still emit an output file for it (only a
+    ".comment: section below image base" warning, exit code 0), but the
+    resulting "PE32+" binary is not actually runnable on Windows
+    (`OSError: [WinError 193] %1 is not a valid Win32 application`).
+    That's a cross-platform toolchain/library-format mismatch specific to
+    this environment, not a bug in my_print_params.c's own logic -- so we
+    document it explicitly (test_prebuilt_lib_is_not_windows_compatible)
+    and separately verify the actual argv-printing behaviour of
+    my_print_params.c's main() by linking it against small local stub
+    implementations of my_putstr/my_putchar instead (compiled fresh for
+    the test, not committed to the exercise itself)."""
 
     DIR = ROOT / "CPool_Day07_2017" / "task04"
     SRC = DIR / "my_print_params.c"
     LIB = DIR / "libmy.a"
+    # GCC >= 14 defaults to treating implicit function declarations as a
+    # hard error for C; my_print_params.c calls my_putstr/my_putchar with
+    # no header/prototype in scope (matching the exercise's original,
+    # more permissive-era compiler), so we relax just that one
+    # diagnostic back to a warning to build it as originally written.
+    RELAX_IMPLICIT_DECL = "-Wno-error=implicit-function-declaration"
 
     def test_source_and_prebuilt_lib_are_present(self):
         assert self.SRC.is_file()
         assert self.LIB.is_file()
 
     @requires_gcc
-    def test_builds_and_prints_each_argv_entry_on_its_own_line(self, tmp_path):
+    def test_builds_and_links_against_prebuilt_libmy_a(self, tmp_path):
         exe = tmp_path / "my_print_params.exe"
         build = run(
             [
-                GCC, "-W", "-Wall",
+                GCC, self.RELAX_IMPLICIT_DECL,
                 str(self.SRC),
                 "-L", str(self.DIR), "-lmy",
                 "-o", str(exe),
@@ -93,6 +113,52 @@ class TestDay07Task04PrintParams:
         )
         assert build.returncode == 0, f"build failed:\n{build.stderr}"
         assert exe.is_file()
+
+    @requires_gcc
+    def test_prebuilt_lib_binary_runs_or_documents_known_platform_mismatch(self, tmp_path):
+        """Try to actually execute the binary built against libmy.a. On a
+        Linux box (where libmy.a's ELF objects match the host format)
+        this should just work. On this Windows/MinGW environment it is
+        expected to fail with WinError 193 -- captured here as a
+        documented finding rather than a silent hang or an opaque
+        failure."""
+        exe = tmp_path / "my_print_params.exe"
+        build = run(
+            [GCC, self.RELAX_IMPLICIT_DECL, str(self.SRC), "-L", str(self.DIR), "-lmy", "-o", str(exe)]
+        )
+        assert build.returncode == 0, f"build failed:\n{build.stderr}"
+
+        try:
+            result = subprocess.run(
+                [str(exe), "hello", "world"], capture_output=True, text=True, timeout=10
+            )
+        except OSError as exc:
+            pytest.xfail(
+                "libmy.a's object files are Linux ELF64, not Windows PE/COFF "
+                f"(cross-platform library format mismatch): {exc}"
+            )
+        else:
+            lines = result.stdout.splitlines()
+            assert lines[-2:] == ["hello", "world"]
+
+    @requires_gcc
+    def test_argv_printing_logic_with_local_stub_helpers(self, tmp_path):
+        """Exercise my_print_params.c's actual main() logic (the thing
+        this piece is meant to demonstrate) without depending on the
+        platform-incompatible prebuilt libmy.a: link it against tiny
+        stub implementations of my_putstr/my_putchar written just for
+        this test."""
+        stub = tmp_path / "stub_helpers.c"
+        stub.write_text(
+            "#include <stdio.h>\n"
+            "void my_putstr(char *str) { printf(\"%s\", str); }\n"
+            "void my_putchar(char c) { printf(\"%c\", c); }\n"
+        )
+        exe = tmp_path / "my_print_params_stub.exe"
+        build = run(
+            [GCC, self.RELAX_IMPLICIT_DECL, str(self.SRC), str(stub), "-o", str(exe)]
+        )
+        assert build.returncode == 0, f"build failed:\n{build.stderr}"
 
         result = run([str(exe), "hello", "world"])
         assert result.returncode == 0
@@ -102,17 +168,9 @@ class TestDay07Task04PrintParams:
         lines = result.stdout.splitlines()
         assert lines[-2:] == ["hello", "world"]
 
-    @requires_gcc
-    def test_no_extra_arguments_prints_only_program_name(self, tmp_path):
-        exe = tmp_path / "my_print_params.exe"
-        build = run(
-            [GCC, str(self.SRC), "-L", str(self.DIR), "-lmy", "-o", str(exe)]
-        )
-        assert build.returncode == 0, f"build failed:\n{build.stderr}"
-
-        result = run([str(exe)])
-        assert result.returncode == 0
-        assert len(result.stdout.splitlines()) == 1
+        result_no_args = run([str(exe)])
+        assert result_no_args.returncode == 0
+        assert len(result_no_args.stdout.splitlines()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -154,18 +212,48 @@ class TestDay12Cat:
 
     @requires_make
     @requires_gcc
-    def test_reads_stdin_when_no_argument_given(self):
+    def test_stdin_path_echoes_input_but_never_exits_known_bug(self):
+        """QA finding (previously undocumented): when invoked with no
+        argument, main.c's stdin branch is
+
+            while (1 != 0) {
+                size = read(fd, buffer, 14999);
+                write(1, buffer, size);
+            }
+
+        with no break/return for EOF (size == 0). It correctly echoes
+        piped stdin once, but then spins forever in a zero-byte
+        read/write busy loop instead of exiting -- so piping a finite
+        input into this binary never terminates on its own; a real
+        user (or shell pipeline) would have to kill it. This is a real
+        bug in the day-by-day exercise; per this QA pass's scope for
+        such a large collection, we document it here (with a bounded
+        wait and an explicit process kill) rather than patching
+        main.c."""
         run([MAKE, "re"], cwd=self.DIR)
         exe = self._binary()
 
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [str(exe)],
-            input="piped through stdin\n",
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=10,
         )
-        assert "piped through stdin" in result.stdout
+        proc.stdin.write("piped through stdin\n")
+        proc.stdin.close()
+        try:
+            stdout, _ = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, _ = proc.communicate()
+            assert "piped through stdin" in stdout
+        else:
+            pytest.fail(
+                "cat's stdin loop terminated on its own -- if main.c's "
+                "EOF handling was fixed, update this test and the QA "
+                "notes in README.md accordingly."
+            )
 
     @requires_make
     @requires_gcc

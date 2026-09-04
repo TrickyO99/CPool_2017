@@ -106,3 +106,86 @@ subdirectory, e.g.:
 cd CPool_bistro-matic_2017
 mingw32-make re
 ```
+
+## QA notes
+
+This collection is too large for exhaustive per-file unit testing (15 day
+folders plus two capstone projects, most of them loose `.c` files with no
+`main()`/build system of their own). Instead, `test_cpool.py` in this
+directory picks the ~5 most meaningfully testable/runnable pieces and
+does real build-it-and-run-it smoke testing on them (via `subprocess` +
+`gcc`/`mingw32-make`), skipping cleanly rather than failing when a
+required tool isn't on `PATH`.
+
+**Tested** (built and/or run with a real MinGW-w64 GCC 16.1.0 toolchain,
+`gcc`/`mingw32-make` from the WinLibs distribution):
+
+- **CPool_Day07_2017/task04** (`my_print_params.c`) — builds and links
+  against the pre-built `libmy.a`. **Bug found:** `libmy.a`'s object
+  files are Linux ELF64 (`objdump -f` reports `file format
+  elf64-x86-64` for every member) — a leftover from the original 2017
+  Epitech Linux VM. MinGW's `ld` will still emit an output file (only a
+  `.comment: section below image base` warning, exit code 0), but the
+  resulting binary is not actually runnable on Windows
+  (`WinError 193: %1 is not a valid Win32 application`). This is a
+  cross-platform toolchain/library-format mismatch, not a bug in
+  `my_print_params.c`'s own logic, so the test suite documents it
+  (`test_prebuilt_lib_binary_runs_or_documents_known_platform_mismatch`,
+  expected to `xfail` on Windows) and separately verifies the real
+  argv-printing behaviour by linking the same source against small
+  local stub implementations of `my_putstr`/`my_putchar` written just
+  for the test.
+- **CPool_Day12_2017/cat** — builds cleanly via its own `Makefile`
+  (`mingw32-make re`) and correctly prints a file's contents given as
+  `argv[1]`, and correctly reports `Error with open` + exit code `84`
+  for a missing file. **Bug found:** the no-argument/stdin code path
+  (`while (1 != 0) { size = read(fd, buffer, 14999); write(1, buffer,
+  size); }`) has no break/exit condition for EOF (`size == 0`) — it
+  echoes piped input correctly but then spins forever instead of
+  exiting, so piping a finite input into this binary never terminates
+  on its own. Previously undocumented; the test suite captures this
+  with a bounded wait + explicit process kill rather than patching
+  `main.c` (day-by-day exercise bugs are documented, not fixed, per
+  this QA pass's scope).
+- **CPool_evalexpr_2017/infinadd.c** — confirmed: plain `gcc` rejects it
+  with `error: assignment to 'char *' from 'int' makes pointer from
+  integer without a cast [-Wint-conversion]` at `result = (s1[i] - 48)
+  + (s2[j] - 48);`, and `-fpermissive` (a normally C++-only GCC flag)
+  does downgrade this specific error to a warning on this toolchain, as
+  already documented above — confirming the day-by-day note. Also
+  confirmed: `infinadd()` never reaches a `return` statement, so even
+  once it builds, the integer `main()` prints is not a real, assembled
+  sum (the routine's own known incompleteness) — the test only asserts
+  it runs to completion, not that it prints a mathematically correct
+  result.
+- **CPool_Day13_2017/task01.c** — CSFML headers happened to be available
+  in this environment, so the test actually compiles this file
+  (`gcc -c task01.c`) rather than skipping; it does not attempt to link
+  or open a real window (no headless SFML backend is assumed).
+- **CPool_Day10_2017/do_op.c** — confirmed genuinely empty (only the
+  header comment, no code): it compiles cleanly as an empty translation
+  unit (`gcc -c`, exit 0) but fails to link into a program
+  (`undefined reference to 'WinMain'`), proving there is no `main()`
+  anywhere in the object.
+
+**Skipped** (not attempted by `test_cpool.py`, documented here instead):
+
+- **CPool_Day01–06, 08, 09, 11** — loose exercise files with no
+  `main()`/build system of their own; out of scope for automated
+  build/run smoke testing (they were unit-tested ad hoc during the
+  original piscine). CPool_Day09_2017 in particular is already noted
+  above as having unresolved syntax issues that would not compile as-is.
+- **CPool_bistro-matic_2017** — already documented above as missing
+  `src/main.c` (and `src/antierror/antierror.c`/`error_base.c`, only
+  their `.o` files remain), so it cannot be rebuilt from source; not
+  re-tested here since the top-level day-by-day notes already cover why.
+- **CPool_Day13_2017/task02.c** — explicitly noted above as incomplete
+  (`put_pixel`/`framebuffer_create` are stubs) and, like `task01.c`,
+  would open a real GUI window if run; not exercised beyond what's
+  already documented.
+
+No day-by-day exercise bugs were fixed as part of this QA pass (per
+scope: this collection is too large for exhaustive fixing) — everything
+above is captured as an automated, clearly-commented test plus this
+note, so a future contributor can see exactly what's known-broken and
+why.
